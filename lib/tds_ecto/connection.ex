@@ -181,20 +181,38 @@ if Code.ensure_loaded?(Tds.Connection) do
       assemble([delete, from, join, where])
     end
 
-    def insert(prefix, table, fields, returning) do
-      values =
-        if fields == [] do
-          returning(returning, "INSERTED") <>
-          "DEFAULT VALUES"
-        else
-          "(" <> Enum.map_join(fields, ", ", &quote_name/1) <> ")" <>
-          " " <> returning(returning, "INSERTED") <>
-          "VALUES (" <> Enum.map_join(1..length(fields), ", ", &"@#{&1}") <> ")"
-        end
-      "INSERT INTO #{quote_table(prefix, table)} " <> values
+    def insert(prefix, table, [], []) do
+      "INSERT INTO #{quote_table(prefix, table)} DEFAULT VALUES"
     end
 
-    def update(prefix, table, fields, filters, returning) do
+    def insert(prefix, table, fields, []) do
+      field_names = Enum.map_join(fields, ", ", &quote_name/1)
+      values = Enum.map_join(1..length(fields), ", ", &"@#{&1}")
+      "INSERT INTO #{quote_table(prefix, table)} (#{field_names}) VALUES (#{values})"
+    end
+
+    def insert(prefix, table, fields, returning) do
+      table_name = quote_table(prefix, table)
+      {field_spec, value_spec} = case fields do
+        [] -> {"", "DEFAULT VALUES"}
+        [_h|_t] ->
+          field_names = Enum.map_join(fields, ", ", &quote_name/1)
+          value_indexes = Enum.map_join(1..length(fields), ", ", &"@#{&1}")
+          {" (#{field_names})", "VALUES (#{value_indexes})"}
+      end
+      tables_with_triggers = Application.get_env(:tds_ecto, :tables_with_triggers, [])
+      unless Enum.member?(tables_with_triggers, table) do
+        returning_clause = returning(returning, "INSERTED")
+        "INSERT INTO #{table_name}#{field_spec} #{returning_clause}#{value_spec}"
+      else
+        temp_table_name = temp_table_name(table)
+        dml_with_temp_table("INSERT INTO #{table_name}#{field_spec} " <>
+          "OUTPUT INSERTED.* INTO #{temp_table_name} #{value_spec}",
+          table_name, temp_table_name, returning)
+      end
+    end
+
+    def update(prefix, table, fields, filters, []) do
       {fields, count} = Enum.map_reduce fields, 1, fn field, acc ->
         {"#{quote_name(field)} = @#{acc}", acc + 1}
       end
@@ -203,17 +221,75 @@ if Code.ensure_loaded?(Tds.Connection) do
         {"#{quote_name(field)} = @#{acc}", acc + 1}
       end
       "UPDATE #{quote_table(prefix, table)} SET " <> Enum.join(fields, ", ") <>
-      " " <> returning(returning, "INSERTED") <>
-        "WHERE " <> Enum.join(filters, " AND ")
+      " WHERE " <> Enum.join(filters, " AND ")
     end
 
-    def delete(prefix, table, filters, returning) do
+    def update(prefix, table, fields, filters, returning) do
+      table_name = quote_table(prefix, table)
+      {fields, count} = Enum.map_reduce fields, 1, fn field, acc ->
+        {"#{quote_name(field)} = @#{acc}", acc + 1}
+      end
+      {filters, _count} = Enum.map_reduce filters, count, fn field, acc ->
+        {"#{quote_name(field)} = @#{acc}", acc + 1}
+      end
+      updates = Enum.join(fields, ", ")
+      conditions = Enum.join(filters, " AND ")
+
+      tables_with_triggers = Application.get_env(:tds_ecto, :tables_with_triggers, [])
+      unless Enum.member?(tables_with_triggers, table) do
+        returning_clause = returning(returning, "INSERTED")
+        "UPDATE #{table_name} SET #{updates} #{returning_clause}WHERE #{conditions}"
+      else
+        temp_table_name = temp_table_name(table)
+        dml_with_temp_table("UPDATE #{table_name} #{updates} " <>
+          "OUTPUT INSERTED.* INTO #{temp_table_name} WHERE #{conditions}",
+          table_name, temp_table_name, returning)
+      end
+    end
+
+    def delete(prefix, table, filters, []) do
       {filters, _} = Enum.map_reduce filters, 1, fn field, acc ->
         {"#{quote_name(field)} = @#{acc}", acc + 1}
       end
+      conditions = Enum.join(filters, " AND ")
 
-      "DELETE FROM #{quote_table(prefix, table)}" <>
-      " " <> returning(returning,"DELETED") <> "WHERE " <> Enum.join(filters, " AND ")
+      "DELETE FROM #{quote_table(prefix, table)} WHERE #{conditions}"
+    end
+
+    def delete(prefix, table, filters, returning) do
+      table_name = quote_table(prefix, table)
+      {filters, _} = Enum.map_reduce filters, 1, fn field, acc ->
+        {"#{quote_name(field)} = @#{acc}", acc + 1}
+      end
+      conditions = Enum.join(filters, " AND ")
+      tables_with_triggers = Application.get_env(:tds_ecto, :tables_with_triggers, [])
+      unless Enum.member?(tables_with_triggers, table) do
+        returning_clause = returning(returning, "DELETED")
+        "DELETE FROM #{table_name} #{returning_clause}WHERE #{conditions}"
+      else
+        temp_table_name = temp_table_name(table)
+        dml_with_temp_table("DELETE FROM #{table_name} " <>
+          "OUTPUT DELETED.* INTO #{temp_table_name} WHERE #{conditions}",
+          table_name, temp_table_name, returning)
+      end
+    end
+
+    # We need to select the ouput into a temporary table if there are
+    # triggers on the table we are inserting to, otherwise error 334 would
+    # occur.
+    # We union the temporary table so its identity columns loose their
+    # identity attribute and we can insert explicit IDs into them.
+    defp dml_with_temp_table(dml_statement, table_name, temp_table_name, returning) do
+      returning_fields = returning_fields(returning)
+      """
+      SET NOCOUNT ON
+      SELECT TOP 0 * INTO #{temp_table_name} FROM #{table_name}
+        UNION ALL SELECT TOP 0 * FROM #{table_name}
+      #{dml_statement}
+      SELECT #{returning_fields} FROM #{temp_table_name}
+      DROP TABLE #{temp_table_name}
+      SET NOCOUNT OFF
+      """
     end
 
     ## Query generation
@@ -511,6 +587,14 @@ if Code.ensure_loaded?(Tds.Connection) do
       do: ""
     defp returning(returning, verb) do
       "OUTPUT " <> Enum.map_join(returning, ", ", fn(arg) -> "#{verb}.#{quote_name(arg)}" end) <> " "
+    end
+
+    defp returning_fields(returning) do
+      Enum.map_join(returning, ", ", fn(arg) -> quote_name(arg) end)
+    end
+
+    defp temp_table_name(table) do
+      "[##{table}_#{Ecto.UUID.generate}]"
     end
 
     # Brute force find unique name
