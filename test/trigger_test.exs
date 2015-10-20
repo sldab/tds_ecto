@@ -7,7 +7,7 @@ defmodule Tds.Ecto.TriggerTest do
     Application.put_env(:tds_ecto, :tables_with_triggers, ["users"])
     Ecto.Adapters.SQL.query(TestRepo,
       "CREATE TRIGGER TEST_TRIGGER ON users FOR INSERT, UPDATE, DELETE " <>
-      "AS BEGIN SET NOCOUNT ON SELECT 333333", [])
+      "AS BEGIN SET NOCOUNT ON SET FMTONLY ON SELECT 333333 FMTONLY OFF NOCOUNT OFF END", [])
     on_exit fn ->
       Application.delete_env(:ecto, :tables_with_triggers)
     end
